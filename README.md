@@ -12,6 +12,7 @@ Built to understand how systems like Datadog work at scale, from the ground up.
 ![React](https://img.shields.io/badge/React-18-61dafb)
 ![Tests](https://img.shields.io/badge/tests-7%20passing-brightgreen)
 ![Deploy](https://img.shields.io/badge/deploy-vercel-black)
+![Database](https://img.shields.io/badge/database-PostgreSQL-336791)
 
 ---
 
@@ -43,7 +44,7 @@ Agent (Python)
   → sends structured metrics to backend via HTTP POST
 
 Backend (FastAPI)
-  → receives and stores metrics in memory
+  → receives and stores metrics in PostgreSQL (Neon)
   → runs anomaly detection on every incoming metric
   → exposes REST API: /metricas, /alertas, /status
 
@@ -57,13 +58,17 @@ Dashboard (React + Recharts)
 
 ## Key Engineering Decisions
 
+### Why PostgreSQL instead of in-memory storage?
+
+Earlier versions stored metrics in a Python list. Simple, but data was lost on every restart — exactly the wrong behavior for an observability tool. The fix is PostgreSQL: metrics survive restarts, historical queries become possible, and multi-agent support is now straightforward to add. The trade-off is a network round-trip on every metric ingestion. At one metric per second, this is negligible.
+
+### Why Neon for the database?
+
+Neon is a serverless PostgreSQL provider with a generous free tier and no cold-start penalty for always-on connections. The alternative was a self-hosted PostgreSQL instance, which adds operational overhead without benefit for a single-agent setup. Neon provides the same wire protocol as standard PostgreSQL — swapping providers requires changing one environment variable.
+
 ### Why polling instead of WebSockets?
 
 For a single-agent setup, polling every 2 seconds is simpler to operate and debug — no persistent connection to manage, no reconnection logic, no client state to synchronize. The trade-off is 2 seconds of latency vs real-time push. For a multi-agent production system serving dozens of dashboards simultaneously, WebSockets or Server-Sent Events would be the correct choice. At this scale, the operational simplicity of polling outweighs the latency cost.
-
-### Why in-memory storage instead of a database?
-
-This version stores metrics in a Python list intentionally. The goal is to demonstrate the core observability pipeline clearly — adding PostgreSQL would be the next step for persistence across restarts, historical queries, and multi-agent support. The trade-off is documented explicitly in the Known Limitations section below.
 
 ### Why configurable thresholds?
 
@@ -82,21 +87,9 @@ Hard-coded thresholds don't work in production. A batch processing server runnin
 
 ## Known Limitations
 
-### Metrics are lost on restart
-
-Watchdog stores metrics in memory. On a typical server capturing one metric per second, a restart loses all data from the current session — there is no persistence.
-
-**When this is acceptable:** development environments, short-lived monitoring sessions, demos.
-
-**When this breaks:** production systems with uptime SLAs, post-incident analysis that requires historical data, any scenario where "what happened 2 hours ago" matters.
-
-**Quantifying the impact:** at 1 metric/second, a 5-minute outage loses 300 data points. For a system tracking CPU spikes during a deploy, those 300 points are exactly the ones you needed.
-
-**The fix:** PostgreSQL persistence — the agent continues sending, the backend writes to a database, and restarts become transparent to the user. This is the first item on the roadmap.
-
 ### No deduplication on alerts
 
-Currently, if CPU stays above threshold for 60 seconds, Watchdog generates 60 alerts — one per second. This produces alert fatigue, which is the exact problem that makes on-call rotations miserable. The correct behavior is to fire once when the threshold is crossed, then suppress until the metric recovers. This requires stateful alert tracking, which is the second item on the roadmap.
+Currently, if CPU stays above threshold for 60 seconds, Watchdog generates 60 alerts — one per second. This produces alert fatigue, which is the exact problem that makes on-call rotations miserable. The correct behavior is to fire once when the threshold is crossed, then suppress until the metric recovers. This requires stateful alert tracking, which is the first item on the roadmap.
 
 ### Single-agent only
 
@@ -109,10 +102,11 @@ The backend assumes one agent reporting metrics. A second agent running on a dif
 | Failure | Behavior | Impact |
 |---|---|---|
 | Agent can't reach backend | HTTP request fails silently, agent retries next second | At most 1 second of missing data |
-| Backend restarts | All in-memory metrics lost | Full session data lost — see Known Limitations |
+| Backend restarts | Metrics persist in PostgreSQL — no data loss | Zero impact on historical data |
 | Dashboard loses connection | Shows last known values until reconnection | Stale data displayed without warning to user |
 | CPU spike detected | Alert generated with exact timestamp and value | Alert storm if spike persists — see Known Limitations |
 | Threshold set too low | False positives flood the alerts panel | Operational noise — adjust CPU_THRESHOLD |
+| Database connection lost | Backend returns 500 until connection recovers | Metrics lost during outage window |
 
 ---
 
@@ -124,8 +118,11 @@ The backend assumes one agent reporting metrics. A second agent running on a dif
 git clone https://github.com/santinopillados-alt/watchdog
 cd watchdog
 
+# Create .env file
+echo "DATABASE_URL=your_postgresql_connection_string" > .env
+
 # Terminal 1 — start backend
-pip install fastapi uvicorn psutil requests
+pip install fastapi uvicorn psutil requests psycopg2-binary python-dotenv
 uvicorn main:app --reload
 
 # Terminal 2 — start agent
@@ -140,16 +137,18 @@ npm run dev
 - Dashboard: http://localhost:5173
 - API docs: http://localhost:8000/docs
 
+> For the database, any PostgreSQL provider works. [Neon](https://neon.tech) offers a free tier with no credit card required.
+
 ---
 
 ## API Reference
 
 ```
 POST /metricas?cpu=45.2&memoria=87.1&timestamp=1234567890
-→ Receives a metric. Runs anomaly detection. Returns alert count.
+→ Receives a metric. Runs anomaly detection. Persists to PostgreSQL. Returns alert count.
 
 GET /metricas
-→ Returns all stored metrics for the current session.
+→ Returns last 100 stored metrics from the database.
 
 GET /alertas
 → Returns all triggered alerts with timestamps and values.
@@ -176,9 +175,10 @@ status endpoint with and without data, and alert retrieval.
 
 ```
 watchdog/
-├── main.py           # FastAPI backend — ingestion, anomaly detection, API
+├── main.py           # FastAPI backend — ingestion, anomaly detection, PostgreSQL, API
 ├── agent.py          # Python agent — captures system metrics, sends to backend
 ├── test_main.py      # 7 pytest tests — covers all endpoints and edge cases
+├── .env              # Database connection string (not committed)
 ├── dashboard/
 │   └── src/
 │       └── App.jsx   # React dashboard — live charts, status cards, alert feed
@@ -193,6 +193,7 @@ watchdog/
 |---|---|---|
 | Agent | Python + psutil | Cross-platform, minimal dependencies, no root required |
 | Backend | FastAPI | Auto-generated OpenAPI docs, async-ready, Pydantic validation |
+| Database | PostgreSQL (Neon) | Persistent storage, survives restarts, standard wire protocol |
 | Dashboard | React 18 + Recharts | Lightweight, no heavy dependencies, no build complexity |
 | Testing | pytest + httpx | Standard Python testing stack, readable assertions |
 | CI | GitHub Actions | Runs tests on every push, provides the green check on commits |
@@ -201,7 +202,7 @@ watchdog/
 
 ## Roadmap
 
-- [ ] PostgreSQL persistence — survive restarts, query historical data
+- [x] PostgreSQL persistence — survive restarts, query historical data (Neon)
 - [ ] Stateful alert tracking — fire once, suppress until recovery
 - [ ] Multi-agent support — monitor multiple servers from one dashboard  
 - [ ] WebSocket streaming — push updates instead of polling
